@@ -1,0 +1,940 @@
+---
+title: "Example VCF processing"
+author: "Philip Sweet"
+date: "2025-03-31"
+output: html_document
+---
+
+## Goal: 
+Read in the raw VCF's from the inital GATK fro Microbes run on the EXAMPLE data and use that to see
+  1. what min depth is being used to call SNPs 
+  1. what patterns across samples (total SNPs, quality of reads, MAF ect)
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(purrr)
+library(cowplot)
+
+vcf_path = c("/Users/example/vcf")
+
+meta_path =c("/Users/example_metadata.csv")
+
+picard_path = c("/Users/tidy_picard_stat_example.csv")
+
+time_path =c("/Users/TimePoint_key.csv")
+```
+
+## Test with one File
+
+```{r read in VCFs}
+
+  
+read_tsv(file = "/Users/example/vcf/example1_bwaMem_s_h_rd_filt.vcf", col_names = TRUE, comment = "##") -> testing
+
+testing %>%
+  unite("snp_ID", `#CHROM`:POS, sep = "_", remove = FALSE) %>%
+  separate_rows(c(FORMAT, SP_KP_1_BWA), sep = ":") %>%
+  pivot_wider(names_from = FORMAT, values_from = SP_KP_1_BWA) %>%
+  mutate(AF = as.numeric(AF)) %>%
+  mutate(filt_pass = ifelse(FILTER == "PASS", "PASS", 
+                      ifelse(FILTER =="weak_evidence", "weak_evidence", "no"))) -> testing_1
+
+```
+
+Sites with multiple SNPs are not getting included in the summary figures 
+
+```{r AF and depth}
+testing_1 %>%
+  ggplot(aes(x = as.numeric(AF), color =filt_pass)) +
+  geom_density()
+
+testing_1 %>%
+  ggplot(aes(x = as.numeric(DP), color =filt_pass)) +
+  geom_density()
+
+testing_1 %>%
+  ggplot(aes(x = as.numeric(DP), color =filt_pass)) +
+  geom_density() +
+  xlim(0,750) +
+  geom_vline(xintercept = 225, linetype = "dashed")
+
+median(testing_1$DP)
+```
+
+
+
+
+```{r read in all files, warning=FALSE}
+
+######### Function to read in VCFs and collect the specific data we need for filtering   ###########
+vcf_reader <- function(file){ 
+  
+  
+  sample_name <- str_remove(basename(file), "Mem_s_h_rd_filt.vcf") %>%
+                  str_replace("__bwa", "_BWA") ## might need to update
+
+  read_tsv(file = file, col_names = TRUE, comment = "##", show_col_types = FALSE) %>%
+  unite("snp_ID", `#CHROM`:POS, sep = "_", remove = FALSE)%>%
+  separate_rows(c(FORMAT, sample_name), sep = ":")%>%
+  pivot_wider(names_from = FORMAT, values_from = sample_name) %>%
+  mutate(SampleID = sample_name) %>%
+  mutate(SampleID = str_remove(SampleID, "_BWA")) %>%
+  separate_rows(c(ALT, AF), sep = ",") %>%
+  mutate(AF = as.numeric(AF)) %>%
+  mutate(VarID = paste(SampleID, snp_ID, ALT, sep = "_")) %>%
+  mutate(filt_pass = ifelse(FILTER == "PASS", "PASS","NO")) %>%
+  dplyr::select(snp_ID, REF, ALT, AD, AF, DP, filt_pass, INFO, FILTER, SampleID,VarID) %>%
+  separate_longer_delim(INFO, delim = ";") %>%
+  separate(INFO, into = c("INFO_Metric","Value"), sep = "=") %>%
+  dplyr::select(-DP) %>%
+  pivot_wider(names_from = INFO_Metric, values_from = Value, names_repair = "unique") %>%
+  mutate(Length = str_length(ALT) - str_length(REF)) %>% 
+  dplyr::select(-c("POPAF", "STR", "AS_FilterStatus","AS_SB_TABLE")) 
+  
+}
+
+######### Get names of all VCfs ############
+## Define File Pattern
+class <- c("_s_h_rd_filt.vcf") ## Sorted_HeaderAdded_ReadGroupsAdded_DefaultFilt
+## File Pattern ## 
+data_list <- list.files(path=vcf_path, pattern= class, full.names=TRUE)
+
+lapply(data_list, FUN=vcf_reader) %>% bind_rows() -> vcfs
+
+write_csv(vcfs, "tidy_SNPs_example.csv")
+```
+
+```{r vcf summary: total SNPs}
+
+## Read in meta data
+
+meta_data <- read.csv(meta_path) %>%
+  mutate(Time= fct_relevel(Time, c("P","T0", "T1","T6","T10","T12"))) 
+
+## Read in vcf data
+
+read_csv("tidy_SNPs_example.csv") -> example_vcfs
+
+
+genome_size = 9600000/1000000
+
+## Combine
+example_vcfs %>%
+  dplyr::select(SampleID, filt_pass, snp_ID, AF) %>%
+  distinct() -> plot_snp
+
+plot_snp %>%
+  mutate(SampleID = str_remove(SampleID, "_BWA")) %>%
+  group_by(SampleID) %>%
+  summarise( SNP_total = length(snp_ID), SNP_pass = sum(filt_pass == "PASS")) %>%
+  left_join(meta_data, by = c("SampleID"="SampleID")) %>% 
+  mutate(var_mb = SNP_pass/genome_size) -> snp_summary_data
+
+snp_summary_data %>%
+  ggplot(aes(y = SNP_total, x = SNP_pass, color = Time)) +
+  geom_point() +
+  facet_wrap(~Ref_ID)+
+  theme_cowplot()
+
+snp_summary_data %>%
+  filter(Time != "T1") %>%
+  ggplot(aes(y = SNP_total, x = SNP_pass, color = Time, shape = Treatment)) +
+  geom_point() +
+  facet_wrap(~Ref_ID)+
+  theme_cowplot()
+
+## GATK fitler pass vs fail
+
+plot_snp %>%
+   mutate(SampleID = str_remove(SampleID, "_BWA")) %>%
+  left_join(meta_data, by = c("SampleID"="SampleID")) %>%
+   filter(Treatment == "None") %>%
+  ggplot(aes( x = Rep, fill = filt_pass)) +
+  geom_bar(position="stack") +
+  ylim(0,8000) +
+    facet_wrap(~Time + Ref_ID , scales = "free_x", nrow = 2) +
+  theme_cowplot() +
+  ggtitle("GATK F/P for SP K.phaffii")-> summary_plot
+
+summary_plot
+
+
+
+plot_snp %>%
+   mutate(SampleID = str_remove(SampleID, "_BWA")) %>%
+  left_join(meta_data, by = c("SampleID"="SampleID")) %>%
+   filter(Treatment == "UV") %>%
+  ggplot(aes( x = Rep, fill = filt_pass)) +
+  geom_bar(position="stack") +
+    ylim(0,8000) +
+   facet_wrap(~Time + Ref_ID , scales = "free_x", nrow = 2) +
+  theme_cowplot()+
+  ggtitle("GATK F/P for UV") -> summary_plot -> summary_plot
+
+summary_plot
+
+## Pass variants per mb
+
+snp_summary_data %>%
+  ggplot(aes(y = var_mb, x = Time, color = Ref_ID)) +
+  geom_boxplot() +
+  facet_wrap(~Ref_ID + Treatment, nrow = 1)+
+  scale_color_manual(values = c("#6bc642","#3895ea")) +
+  theme_cowplot() +
+  ylim(0,400) +
+  ggtitle("Default GATK PASS Variants/Sample") +
+  ylab("GATK PASS (var/mb)") -> pass_plot
+
+pass_plot
+
+snp_summary_data %>%
+  filter(Treatment != "UV") %>%
+  ggplot(aes(y = var_mb, x = Time, color = Ref_ID)) +
+  geom_boxplot() +
+  facet_wrap(~Ref_ID, nrow = 1)+
+  scale_color_manual(values = c("#6bc642","#3895ea")) +
+  theme_cowplot() +
+  ylim(0,400) +
+  ggtitle("Default GATK PASS Variants/Sample") +
+  ylab("GATK PASS (var/mb)") 
+
+## MAF 
+
+plot_snp %>%
+  filter(filt_pass == "PASS") %>%
+   mutate(SampleID = str_remove(SampleID, "_BWA")) %>%
+  left_join(meta_data, by = c("SampleID"="SampleID")) %>%
+  filter(Treatment != "UV") %>%
+  filter(SampleID != "SP_KP_17") %>%
+  ggplot(aes( x = AF, color = Ref_ID)) +
+  geom_density() +
+  scale_color_manual(values = c("#6bc642","#3895ea")) +
+   facet_wrap(~Time, scales = "free_x") +
+  theme_cowplot() +
+  ggtitle("GATK F/P")
+
+plot_snp %>%
+  filter(filt_pass == "PASS") %>%
+   mutate(SampleID = str_remove(SampleID, "_BWA")) %>%
+  left_join(meta_data, by = c("SampleID"="SampleID")) %>%
+  filter(Treatment == "UV") %>%
+  ggplot(aes( x = AF, color = Ref_ID)) +
+  geom_density() +
+  scale_color_manual(values = c("#6bc642","#3895ea")) +
+   facet_wrap(~Time, scales = "free_x") +
+  theme_cowplot() +
+  ggtitle("GATK F/P for UV")
+
+## Earth Time shift
+
+## read in storage time data 
+
+read.csv(time_path, header = TRUE) %>%
+  filter(Class == "SP") -> time_data
+
+plot_snp %>%
+  filter(filt_pass == "PASS") %>%
+   mutate(SampleID = str_remove(SampleID, "_BWA")) %>%
+  left_join(meta_data, by = c("SampleID"="SampleID")) %>%
+  left_join(time_data, by = c("Time" = "TimePoint")) %>%
+  filter(Ref_ID == "Earth") %>%
+  ggplot(aes( x = AF, group = Time, color = Time_Months)) +
+  geom_density() +
+  facet_wrap(~Treatment) +
+  scale_color_gradient(low = "blue", high = "red", name = "Time (Months)") +
+  theme_cowplot() +
+  ggtitle("Allele Frequence Shift with Storage Time") -> shift_plot
+
+shift_plot
+
+
+```
+
+
+```{r vcf summary: Depth}
+
+read_csv(picard_path) %>%
+  left_join(snp_summary_data, by = c("source"="SampleID")) %>%
+  mutate(Input_Read_Pairs = READ_PAIRS_EXAMINED - (READ_PAIRS_EXAMINED * PERCENT_DUPLICATION)) -> picard_data
+
+picard_data %>%
+  ggplot(aes(y = SNP_total, x = Input_Read_Pairs, color = Time)) +
+  geom_point() +
+  facet_wrap(~Ref_ID)
+
+picard_data %>%
+  filter(Time != "T6") %>%
+  ggplot(aes(x = SNP_total, y = Input_Read_Pairs/1000000, color = Time)) +
+  geom_point() +
+  ylab("Input Read Paires (M)") +
+  facet_wrap(~Ref_ID)+
+  theme_cowplot()
+
+picard_data %>%
+  filter(Time != "T6") %>%
+  ggplot(aes(x = SNP_pass, y = Input_Read_Pairs/1000000, color = Time)) +
+  geom_point() +
+  facet_wrap(~Ref_ID) +
+  ylab("Input Read Paires (M)") +
+  theme_cowplot()
+
+
+
+
+```
+
+COM BACK WITH PICARD
+
+For the 
+```{r Occurance}
+
+## Multiple Occurances
+example_vcfs %>%
+  separate(snp_ID, remove = FALSE, into = c("x","ChromID", "Postion"), sep = "_") %>%
+  ggplot(aes(x = as.numeric(Postion))) +
+  geom_histogram() +
+  facet_wrap(~ChromID, scales = "free_x")
+
+example_vcfs %>%
+  filter(filt_pass == "PASS") %>%
+  separate(snp_ID, remove = FALSE, into = c("x","ChromID", "Postion"), sep = "_") %>%
+  ggplot(aes(x = as.numeric(Postion))) +
+  geom_histogram() +
+  facet_wrap(~ChromID, scales = "free_x")
+
+example_vcfs %>%
+  filter(filt_pass == "PASS") %>%
+  group_by(snp_ID) %>%
+  mutate(site_count = n()/4) %>%
+  ggplot(aes(x=site_count)) +
+    geom_bar() +
+  ggtitle("Variant Sites Across  Samples")
+
+
+kl_vcfs %>%
+  filter(filt_pass == "PASS") %>%
+  group_by(snp_ID) %>%
+  mutate(site_count = n()/4) %>%
+  ggplot(aes(x=site_count, y = AF)) +
+    geom_point() +
+  ggtitle("Pop. Occurance vs Read Percent")
+
+
+```
+Fromn Positional plots, lots at the start of each Chrom
+
+So you can see a trend in sites either having 1 or 2 hits or being present in all samples (n=44). Sites with SNPs in ever sample are likely to be polymophic. The other filter suggested is removing those from the production set. Will look at that later, after filtering for other metrics.  
+
+When looking at Site Depth, I am reminded that some sites have multiple allels (AD has multiple options). Doesn't matter for Site depth but does matter for MAF....
+
+```{r Variant Site Depth Filtering}
+
+## Site Depth
+example_vcfs %>%
+  filter(filt_pass == "PASS") %>% ## Select those variants that pass the default Gatk 4 Microbes filtering
+  dplyr::select(snp_ID, AD, AF, DP, SampleID) %>%
+  distinct() %>%
+  mutate(SampleID = str_remove(SampleID, "_BWA")) %>%
+  left_join(meta_data, by = c("SampleID"="SampleID")) -> graph_data
+
+
+graph_data %>%
+  filter(Treatment == "None") %>%
+  ggplot(aes(x = as.numeric(DP), fill = Ref_ID)) +
+  geom_histogram(alpha = 0.5) +
+  scale_fill_manual(values = c("#6bc642","#aaaaaa")) +
+  facet_wrap(~Time) +
+  theme_cowplot()+
+  ggtitle("Variant Site Depth K. phaffii ")
+
+graph_data %>%
+  filter(Treatment == "UV") %>%
+  ggplot(aes(x = as.numeric(DP), fill = Ref_ID)) +
+  geom_histogram(alpha = 0.5) +
+  scale_fill_manual(values = c("#6bc642","#aaaaaa")) +
+  facet_wrap(~Time) +
+  theme_cowplot()+
+  ggtitle("Variant Site Depth K. phaffii+ UV")
+
+
+graph_data %>%
+  group_by(Time, Treatment) %>%
+  summarise(mean_depth = mean(as.numeric(DP)),
+            medain_depth = median(as.numeric(DP)))
+
+graph_data  %>%
+  filter(Treatment == "None") %>%
+  ggplot(aes(x = as.numeric(DP), fill = Ref_ID)) +
+  geom_histogram(alpha = 0.5) +
+  scale_fill_manual(values = c("#6bc642","#aaaaaa")) +
+  facet_wrap(~Time) +
+  theme_cowplot() +
+  xlim(0,1500) +
+  geom_vline(xintercept = 800, linetype = "dashed", color = "red") +
+  ggtitle("Variant Site Depth")
+
+graph_data %>%
+  filter(Treatment == "UV") %>%
+  ggplot(aes(x = as.numeric(DP), fill = Ref_ID)) +
+  geom_histogram(alpha = 0.5) +
+  scale_fill_manual(values = c("#6bc642","#aaaaaa")) +
+  facet_wrap(~Time) +
+  theme_cowplot() +
+  xlim(0,1500) +
+  geom_vline(xintercept = 800, linetype = "dashed", color = "red") +
+  ggtitle("Variant Site Depth UV")
+
+example_vcfs %>%
+  mutate(filt_pass = ifelse(filt_pass == "PASS", ifelse(DP > 800, "DP_Filt", "PASS"), filt_pass)) -> dp_filt
+  
+dp_filt %>%
+  dplyr::select(snp_ID, ALT, SampleID,filt_pass) %>%
+  distinct() %>%
+  group_by(filt_pass) %>%
+  summarise(sum = n())
+  
+```
+
+This is difficult, we're seeing a bi-modal distribution of site depths. This might be due to the mtDNA sites? I will need to pull out the sites by depth and see where they are mapping in the genom. For the production and T0, doesn;t seem to be as much of an issue but major for T10 adn T1. UV shows the effect mostly at T10, but T1 has a wide peak. Unclear where to cut 
+
+```{r Base Quality Filtering}
+
+dp_filt %>%
+  filter(INFO_Metric == "MBQ") %>%
+  mutate(SampleID = str_remove(SampleID, "_BWA")) %>%
+  left_join(meta_data, by = c("SampleID"="SampleID")) %>%
+  filter(Treatment != "UV") %>%
+  ggplot(aes(x = as.numeric(Metric_Measure), color = Metric_Allel)) +
+  geom_density(aes(linetype = Ref_ID)) +
+  facet_wrap(~Time) +
+  xlab("Mean Base Quality Score") +
+  geom_vline(xintercept = 20, linetype = "dashed", color = "red") +
+  ggtitle("Total Mean Base Quality")
+
+dp_filt %>%
+  filter(INFO_Metric == "MBQ") %>%
+  mutate(SampleID = str_remove(SampleID, "_BWA")) %>%
+  left_join(meta_data, by = c("SampleID"="SampleID")) %>%
+  filter(Treatment == "UV") %>%
+  ggplot(aes(x = as.numeric(Metric_Measure), color = Metric_Allel)) +
+  geom_density(aes(linetype = Ref_ID)) +
+  facet_wrap(~Time) +
+  xlab("Mean Base Quality Score") +
+  geom_vline(xintercept = 20, linetype = "dashed", color = "red") +
+  ggtitle("Total Mean Base Quality + UV")
+ 
+
+dp_filt %>%
+  filter(filt_pass == "PASS") %>% ## Select those variants that pass the default Gatk 4 Microbes filtering
+  filter(INFO_Metric == "MBQ") %>%
+  mutate(SampleID = str_remove(SampleID, "_BWA")) %>%
+  left_join(meta_data, by = c("SampleID"="SampleID")) %>%
+  filter(Treatment != "UV") %>%
+  ggplot(aes(x = as.numeric(Metric_Measure), color = Metric_Allel)) +
+  geom_density(aes(linetype = Ref_ID)) +
+  facet_wrap(~Time) +
+  xlab("Mean Base Quality Score") +
+  geom_vline(xintercept = 20, linetype = "dashed", color = "red") +
+  ggtitle("GATK PASS Mean Base Quality")
+
+dp_filt  %>%
+  filter(filt_pass == "PASS") %>% ## Select those variants that pass the default Gatk 4 Microbes filtering
+  filter(INFO_Metric == "MBQ") %>%
+  mutate(SampleID = str_remove(SampleID, "_BWA")) %>%
+  left_join(meta_data, by = c("SampleID"="SampleID")) %>%
+  filter(Treatment == "UV") %>%
+  ggplot(aes(x = as.numeric(Metric_Measure), color = Metric_Allel)) +
+  geom_density(aes(linetype = Ref_ID)) +
+  facet_wrap(~Time) +
+  xlab("Mean Base Quality Score") +
+  geom_vline(xintercept = 20, linetype = "dashed", color = "red") +
+  ggtitle("GATK PASS Mean Base Quality +UV ")
+
+
+dp_filt %>%
+  mutate(filt_pass = ifelse(filt_pass == "PASS", ifelse(INFO_Metric == "MBQ" & Metric_Measure < 20, "MBQ_Filt", "PASS"), filt_pass)) -> mb_dp_filt
+  
+mb_dp_filt  %>%
+  dplyr::select(snp_ID, ALT, SampleID,filt_pass) %>%
+  distinct() %>%
+  group_by(filt_pass) %>%
+  summarise(sum = n())
+  
+```
+
+https://www.htslib.org/workflow/filter.html
+
+
+```{r mapping score}
+
+dp_filt %>%
+   filter(INFO_Metric == "MMQ") %>%
+   mutate(SampleID = str_remove(SampleID, "_BWA")) %>%
+   left_join(meta_data, by = c("SampleID"="SampleID")) %>%
+   ggplot(aes(x = as.numeric(Metric_Measure), color = Metric_Allel)) +
+   geom_density() +
+   facet_wrap(~Time) +
+  xlab("Mean Mapping Quality Score")+
+  ggtitle("Total Mean Mapping")
+
+dp_filt %>%
+  filter(filt_pass == "PASS") %>% ## Select those variants that pass the default Gatk 4 Microbes filtering
+   filter(INFO_Metric == "MMQ") %>%
+   mutate(SampleID = str_remove(SampleID, "_BWA")) %>%
+   left_join(meta_data, by = c("SampleID"="SampleID")) %>%
+   ggplot(aes(x = as.numeric(Metric_Measure), color = Metric_Allel)) +
+   geom_density() +
+   facet_wrap(~Time) +
+  xlab("Mean Mapping Quality Score") +
+  ggtitle("GATK PASS Mean Mapping")
+```
+
+```{r MAF}
+
+mb_dp_filt %>%
+  separate(AD, sep = ",", into =c("RefCount"), extra = "drop", remove = FALSE) %>%
+  mutate(MAF = - ((as.numeric(RefCount) - as.numeric(DP))/as.numeric(DP))) -> maf_mb_dp_filt
+
+maf_mb_dp_filt %>%
+   mutate(SampleID = str_remove(SampleID, "_BWA")) %>%
+   left_join(meta_data, by = c("SampleID"="SampleID")) -> graph_data
+
+graph_data %>%
+   ggplot(aes(x = MAF, color = Ref_ID, linetype = Treatment)) +
+    geom_density() +
+    facet_wrap(~Time) +
+    xlab("MAF") +
+   geom_vline(xintercept = 0.3, linetype = "dashed") +
+    ggtitle("Total SNP MAF")
+
+graph_data %>%
+    filter(filt_pass == "PASS") %>% ## Select those variants that pass the default Gatk 4 Microbes filtering
+       ggplot(aes(x = MAF, color = Ref_ID, linetype = Treatment)) +
+      geom_density() +
+      facet_wrap(~Time) +
+      xlab("MAF")+
+    geom_vline(xintercept = 0.3, linetype = "dashed") +
+    ggtitle("GATK PASS SNP MAF")
+
+
+maf_mb_dp_filt %>%
+  mutate(filt_pass = ifelse(filt_pass == "PASS", ifelse(MAF <= .3, "PASS", "MAF_Filt"), filt_pass)) -> maf2_mb_dp_filt
+
+
+#maf_mb_dp_filt %>%
+  #mutate(filt_pass = filt_pass) -> maf2_mb_dp_filt
+  
+maf2_mb_dp_filt %>%
+  dplyr::select(snp_ID, ALT, SampleID,filt_pass) %>%
+  distinct() %>%
+  group_by(filt_pass) %>%
+  summarise(sum = n())
+
+
+```
+
+
+
+```{r second visit to multisite}
+
+
+ maf2_mb_dp_filt %>%
+   mutate(SampleID = str_remove(SampleID, "_BWA")) %>%
+   left_join(meta_data, by = c("SampleID"="SampleID")) -> graph_data
+
+
+graph_data %>%
+  group_by(snp_ID) %>%
+  mutate(site_count = n()/4) %>%
+  ggplot(aes(x=site_count,fill = Ref_ID)) +
+    geom_bar() +
+  facet_wrap(~Time)
+  ggtitle("Variant Sites Across KL Samples")
+  
+  graph_data %>%
+   mutate(filt_pass = fct_relevel(filt_pass, c("PASS","MAF_Filt", "MBQ_Filt","DP_Filt","NO"))) %>%
+    group_by(snp_ID) %>%
+    mutate(site_count = n()/4) %>%
+    ggplot(aes(x=site_count,fill = filt_pass)) +
+      geom_bar() +
+      facet_wrap(~Time, scales = "free_y") +
+      ggtitle("All Variant Sites Across Samples")
+  
+    graph_data %>%
+   mutate(filt_pass = fct_relevel(filt_pass, c("PASS","MAF_Filt", "MBQ_Filt","DP_Filt","NO"))) %>%
+    group_by(snp_ID) %>%
+    mutate(site_count = n()/4) %>%
+      filter(filt_pass != "NO") %>%
+    ggplot(aes(x=site_count,fill = filt_pass)) +
+      geom_bar() +
+      facet_wrap(~Time, scales = "free_y") +
+      ggtitle("GATK PASS Variant Sites Across Samples")
+
+graph_data %>%
+  filter(Treatment != "UV") %>%
+  filter(filt_pass == "PASS") %>%
+  group_by(snp_ID) %>%
+  mutate(site_count = n()/4) %>%
+  ggplot(aes(x=site_count, fill = Ref_ID)) +
+  geom_bar() +
+  facet_wrap(~Time) +
+  ggtitle("Variant Sites Across Samples")
+
+graph_data %>%
+  filter(Treatment == "UV") %>%
+  filter(filt_pass == "PASS") %>%
+  group_by(snp_ID) %>%
+  mutate(site_count = n()/4) %>%
+  ggplot(aes(x=site_count, fill = Ref_ID)) +
+  geom_bar() +
+  facet_wrap(~Time) +
+  ggtitle("Variant Sites Across Samples")
+
+```
+Increase at 10 but drops down at T12. DOes look like more ISS for non-UV
+
+```{r fitler out Production SNPs}
+
+maf2_mb_dp_filt  %>%
+   mutate(SampleID = str_remove(SampleID, "_BWA")) %>%
+   left_join(meta_data, by = c("SampleID"="SampleID")) %>%
+  filter(Treatment != "UV") %>%
+  mutate(Prod_SNP = ifelse(Time == "P", 1,0)) %>%
+  group_by(snp_ID) %>%
+  mutate(site_class = sum(Prod_SNP)) %>%
+  ungroup() %>%
+  mutate(filt_pass = ifelse(filt_pass == "PASS", ifelse(site_class > 3, "Prod_Filt", "PASS"), filt_pass)) -> prd_maf2_mb_dp_filt_none
+
+maf2_mb_dp_filt  %>%
+   mutate(SampleID = str_remove(SampleID, "_BWA")) %>%
+   left_join(meta_data, by = c("SampleID"="SampleID")) %>%
+  filter(Treatment == "UV") %>%
+  mutate(Prod_SNP = ifelse(Time == "P", 1,0)) %>%
+  group_by(snp_ID) %>%
+  mutate(site_class = sum(Prod_SNP)) %>%
+  ungroup() %>%
+  mutate(filt_pass = ifelse(filt_pass == "PASS", ifelse(site_class > 3, "Prod_Filt", "PASS"), filt_pass)) -> prd_maf2_mb_dp_filt_UV
+  
+
+    prd_maf2_mb_dp_filt_none %>%
+    mutate(filt_pass = fct_relevel(filt_pass, c("PASS","Prod_Filt","MAF_Filt", "MBQ_Filt","DP_Filt","NO"))) %>%
+    group_by(snp_ID) %>%
+    mutate(site_count = n()/4) %>%
+    filter(filt_pass != "NO") %>%
+    ggplot(aes(x=site_count,fill = filt_pass)) +
+      geom_bar() +
+      facet_wrap(~Time, scales = "free_y") +
+      ggtitle("Variant Sites Across Samples")
+    
+       prd_maf2_mb_dp_filt_UV %>%
+    mutate(filt_pass = fct_relevel(filt_pass, c("PASS","Prod_Filt","MAF_Filt", "MBQ_Filt","DP_Filt","NO"))) %>%
+    group_by(snp_ID) %>%
+    mutate(site_count = n()/4) %>%
+    filter(filt_pass != "NO") %>%
+    ggplot(aes(x=site_count,fill = filt_pass)) +
+      geom_bar() +
+      facet_wrap(~Time, scales = "free_y") +
+      ggtitle("Variant Sites Across Samples +UV")
+    
+    
+  prd_maf2_mb_dp_filt_none %>%
+  group_by(filt_pass) %>%
+  summarise(sum_None = n())
+
+  prd_maf2_mb_dp_filt_UV %>%
+  group_by(filt_pass) %>%
+  summarise(sum_UV = n())
+  
+prd_maf2_mb_dp_filt_none %>%
+    mutate(filt_pass = fct_relevel(filt_pass, c("PASS","Prod_Filt","MAF_Filt", "MBQ_Filt","DP_Filt","NO"))) %>%
+    group_by(snp_ID) %>%
+    mutate(site_count = n()/4) %>%
+    filter(filt_pass == "PASS") %>%
+    ggplot(aes(x=site_count,fill = Ref_ID)) +
+      geom_bar() +
+      facet_wrap(~Time) +
+      ggtitle("Variant Sites Across Samples")
+
+prd_maf2_mb_dp_filt_none %>%
+    mutate(filt_pass = fct_relevel(filt_pass, c("PASS","Prod_Filt","MAF_Filt", "MBQ_Filt","DP_Filt","NO"))) %>%
+    group_by(snp_ID) %>%
+    mutate(site_count = n()/4) %>%
+    filter(filt_pass == "PASS") %>%
+  filter(Time != "T1") %>%
+    ggplot(aes(x=site_count,fill = Ref_ID)) +
+      geom_bar() +
+      facet_wrap(~Time) +
+      ggtitle("Variant Sites Across Samples")
+
+
+prd_maf2_mb_dp_filt_UV %>%
+    mutate(filt_pass = fct_relevel(filt_pass, c("PASS","Prod_Filt","MAF_Filt", "MBQ_Filt","DP_Filt","NO"))) %>%
+    group_by(snp_ID) %>%
+    mutate(site_count = n()/4) %>%
+    filter(filt_pass == "PASS") %>%
+    ggplot(aes(x=site_count,fill = Ref_ID)) +
+      geom_bar() +
+      facet_wrap(~Time) +
+      ggtitle("Variant Sites Across Samples +UV")
+
+
+```
+
+
+```{r summary of Non-UV PASS}
+
+read_csv("filt_KP_SP.csv") %>%
+  filter(filt_pass == "PASS") %>%
+  mutate(l_ref = nchar(REF)) %>%
+  mutate(l_alt = nchar(ALT)) %>%
+  mutate(var_size = l_alt - l_ref) %>%
+  mutate(var_class = ifelse(var_size == 0, "SNP", "InDel")) %>%
+  dplyr::select(snp_ID, REF, ALT, Ref_ID, SN, Time, Rep, SampleID, var_size, var_class) %>%
+    distinct() -> tidy_pass
+
+
+tidy_pass %>%
+   mutate(Time= fct_relevel(Time, c("T0","T1", "T6","T10","T12"))) %>%
+  group_by(Time, Ref_ID, Rep) %>%
+  summarise(total_var = n()) %>%
+  ggplot( aes(x = Ref_ID, y = total_var, color = Ref_ID)) +
+    geom_boxplot() +
+    scale_color_manual(values = c("#6bc642", "#3895ea","#aaaaaa")) +
+    facet_wrap(~Time, nrow =1)
+
+tidy_pass %>%
+  mutate(Time= fct_relevel(Time, c("T0","T1", "T6","T10","T12"))) %>%
+  filter(Time != "T1") %>%
+  group_by(Time, Ref_ID, Rep) %>%
+  summarise(total_var = n()) %>%
+  ggplot( aes(x = Ref_ID, y = total_var, color = Ref_ID)) +
+    geom_boxplot() +
+    scale_color_manual(values = c("#6bc642", "#3895ea","#aaaaaa")) +
+    facet_wrap(~Time, nrow =1)
+
+## A better version would be the whole length of the chrom, bound properly
+tidy_pass %>%
+  separate(snp_ID, remove = FALSE, into = c("x","ChromID", "Postion"), sep = "_") %>%
+  ggplot(aes(x = as.numeric(Postion), fill = Time)) +
+  geom_histogram() +
+  facet_wrap(~ChromID, scales = "free_x")
+
+tidy_pass %>%
+  filter(Time != "T1") %>%
+  separate(snp_ID, remove = FALSE, into = c("x","ChromID", "Postion"), sep = "_") %>%
+  ggplot(aes(x = as.numeric(Postion), fill = Time)) +
+  geom_histogram() +
+  facet_wrap(~ChromID, scales = "free_x")
+
+## Distribution of InDels
+tidy_pass %>%
+  filter(var_class == "InDel") %>%
+  ggplot(aes(x = var_size, fill = Time)) +
+  geom_histogram()
+
+tidy_pass %>%
+  filter(Time != "T1") %>%
+  filter(var_class == "InDel") %>%
+  ggplot(aes(x = var_size, fill = Time)) +
+  geom_histogram()
+
+```
+## Relative to Total Read Pairs
+
+```{r Snps to Reads}
+read_csv(picard_path) %>%
+  mutate(Input_Read_Pairs = READ_PAIRS_EXAMINED - (READ_PAIRS_EXAMINED * PERCENT_DUPLICATION)) -> picard_data
+
+tidy_pass %>%
+  group_by(SampleID, Ref_ID, Time) %>%
+  summarise(total_var = n()) %>%
+  left_join(picard_data, by = c("SampleID"="source")) %>%
+  ggplot(aes(x = Input_Read_Pairs/1000000, y = total_var, color = Time))+
+  geom_point() +
+  facet_wrap(~Ref_ID)+
+  theme_cowplot() +
+  ylab("Read Pairs (M") +
+  ggtitle("Number of High Quality Variants vs Input Read Pairs")
+
+tidy_pass %>%
+  filter(Time != "T1") %>%
+  group_by(SampleID, Ref_ID, Time) %>%
+  summarise(total_var = n()) %>%
+  left_join(picard_data, by = c("SampleID"="source")) %>%
+  ggplot(aes(x = Input_Read_Pairs/1000000, y = total_var, color = Time))+
+  geom_point() +
+  facet_wrap(~Ref_ID)+
+  theme_cowplot() +
+  ylab("Read Pairs (M") +
+  ggtitle("Number of High Quality Variants vs Input Read Pairs")
+
+```
+
+## Rates of TsTv
+```{r}
+
+tidy_pass %>%
+  filter(var_class == "SNP") %>%
+  unite(REF:ALT, col = "TsTv") %>%
+  group_by(Time) %>%
+  mutate(t_total = length(Rep)) %>%
+  group_by(Time, TsTv) %>%
+  mutate(tstv_total = length(Rep)) %>%
+  group_by(Time, TsTv) %>%
+  summarise(rel_freq = tstv_total/t_total) -> tstv_rates
+
+tidy_pass %>%
+  filter(var_class == "SNP") %>%
+  mutate(site_size = nchar(REF)) %>%
+  filter(site_size < 2) %>%
+  unite(REF:ALT, col = "TsTv") %>%
+  ggplot(aes(x = TsTv, fill = Time)) +
+  geom_bar(position = position_dodge2(preserve = "single")) +
+  facet_wrap(~Ref_ID) +
+  theme_cowplot() +coord_flip()
+
+tidy_pass %>%
+  filter(Time != "T1") %>%
+  filter(var_class == "SNP") %>%
+  mutate(site_size = nchar(REF)) %>%
+  filter(site_size < 2) %>%
+  unite(REF:ALT, col = "TsTv") %>%
+  ggplot(aes(x = TsTv, fill = Time)) +
+  geom_bar(position = position_dodge2(preserve = "single")) +
+  facet_wrap(~Ref_ID) +
+  theme_cowplot() +coord_flip()
+
+tidy_pass %>%
+  filter(Time != "T1") %>%
+  filter(var_class == "SNP") %>%
+  mutate(site_size = nchar(REF)) %>%
+  filter(site_size < 2) %>%
+  unite(REF:ALT, col = "TsTv") %>%
+  ggplot(aes(x = TsTv, fill = Ref_ID)) +
+  geom_bar(position = position_dodge2(preserve = "single")) +
+  facet_wrap(~Time) +
+  theme_cowplot() +coord_flip()
+
+tidy_pass %>%
+  filter(var_class == "SNP") %>%
+  mutate(site_size = nchar(REF)) %>%
+  filter(site_size < 2) %>%
+  unite(REF:ALT, col = "TsTv") %>%
+  group_by(Time) %>%
+  mutate(t_total = length(Rep)) %>%
+  group_by(Time, TsTv) %>%
+  mutate(tstv_total = length(Rep)) %>%
+  group_by(Time, Ref_ID, TsTv) %>%
+  summarise(rel_freq = tstv_total/t_total) %>%
+  distinct()-> tstv_rates
+```
+
+## UV SAMPLES
+
+```{r summary of UV PASS}
+
+read_csv("filt_KP_SP_UV.csv") %>%
+  filter(filt_pass == "PASS") %>%
+  mutate(l_ref = nchar(REF)) %>%
+  mutate(l_alt = nchar(ALT)) %>%
+  mutate(var_size = l_alt - l_ref) %>%
+  mutate(var_class = ifelse(var_size == 0, "SNP", "InDel")) %>%
+  dplyr::select(snp_ID, REF, ALT, Ref_ID, SN, Time, Rep, SampleID, var_size, var_class) %>%
+    distinct() -> tidy_pass
+
+tidy_pass %>%
+   mutate(Time= fct_relevel(Time, c("T0","T1","T10"))) %>%
+  group_by(Time, Ref_ID, Rep) %>%
+  summarise(total_var = n()) %>%
+  ggplot( aes(x = Ref_ID, y = total_var, color = Ref_ID)) +
+    geom_boxplot() +
+    scale_color_manual(values = c("#6bc642", "#3895ea","#aaaaaa")) +
+    facet_wrap(~Time, nrow =1)
+
+
+## A better version would be the whole length of the chrom, bound properly
+tidy_pass %>%
+  separate(snp_ID, remove = FALSE, into = c("x","ChromID", "Postion"), sep = "_") %>%
+  ggplot(aes(x = as.numeric(Postion), fill = Time)) +
+  geom_histogram() +
+  facet_wrap(~ChromID, scales = "free_x")
+
+## Distribution of InDels
+tidy_pass %>%
+  filter(var_class == "InDel") %>%
+  ggplot(aes(x = var_size, fill = Time)) +
+  geom_histogram()
+
+```
+
+```{r UV picard}
+## Relative to Total Read Pairs
+
+read_csv(picard_path) %>%
+  mutate(Input_Read_Pairs = READ_PAIRS_EXAMINED - (READ_PAIRS_EXAMINED * PERCENT_DUPLICATION)) -> picard_data
+
+tidy_pass %>%
+  group_by(SampleID, Ref_ID, Time) %>%
+  summarise(total_var = n()) %>%
+  left_join(picard_data, by = c("SampleID"="source")) %>%
+  ggplot(aes(y = Input_Read_Pairs/1000000, x = total_var, color = Time))+
+  geom_point() +
+  facet_wrap(~Ref_ID)+
+  theme_cowplot() +
+  ylab("Read Pairs (M") +
+  ggtitle("Number of High Quality Variants vs Input Read Pairs")
+
+tidy_pass %>%
+  filter(Time != "T6") %>%
+  group_by(SampleID, Ref_ID, Time) %>%
+  summarise(total_var = n()) %>%
+  left_join(picard_data, by = c("SampleID"="source")) %>%
+  ggplot(aes(y = Input_Read_Pairs/1000000, x = total_var, color = Time))+
+  geom_point() +
+  facet_wrap(~Ref_ID)+
+  theme_cowplot() +
+  ylab("Read Pairs (M") +
+  ggtitle("Number of High Quality Variants vs Input Read Pairs")
+
+```
+
+```{r UV tstv}
+## Rates
+
+tidy_pass %>%
+  filter(var_class == "SNP") %>%
+  unite(REF:ALT, col = "TsTv") %>%
+  ggplot(aes(x = TsTv, fill = Ref_ID)) +
+  geom_bar(position = position_dodge2(preserve = "single")) +
+  scale_fill_manual(values = c("#6bc642","#aaaaaa"))+
+  theme_cowplot()
+
+tidy_pass %>%
+  filter(var_class == "SNP") %>%
+  unite(REF:ALT, col = "TsTv") %>%
+  ggplot(aes(x = TsTv, fill = Time)) +
+  geom_bar(position = position_dodge2(preserve = "single")) +
+  theme_cowplot()
+
+
+tidy_pass %>%
+  filter(var_class == "SNP") %>%
+  unite(REF:ALT, col = "TsTv") %>%
+  group_by(Time) %>%
+  mutate(t_total = length(Rep)) %>%
+  group_by(Time, TsTv) %>%
+  mutate(tstv_total = length(Rep)) %>%
+  group_by(Time, TsTv) %>%
+  summarise(rel_freq = tstv_total/t_total) -> tstv_rates
+
+tstv_rates %>%
+  ggplot(aes(x = TsTv, y = rel_freq, fill = TsTv)) +
+  geom_col(position = position_dodge2(preserve = "single")) +
+  facet_wrap(~Time, nrow = 1) +
+  theme_cowplot()
+
+```
+
+
